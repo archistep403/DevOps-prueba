@@ -1,0 +1,36 @@
+{
+  "name": "storego-react",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "server": "node --watch server/index.js",
+    "dev:all": "concurrently -n web,api -c cyan,magenta \"npm:dev\" \"npm:server\"",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server/index.js",
+    "db:init": "node server/init-db.js",
+    "test": "vitest run",
+    "test:ci": "vitest run --coverage",
+    "docker:env": "node scripts/gen-env-docker.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.11.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "@vitest/coverage-v8": "^2.1.9",
+    "concurrently": "^9.1.0",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.9"
+  }
+}

@@ -1,0 +1,310 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Una sola ejecución por rama: si llega un commit nuevo, se cancela la anterior.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Mínimo privilegio: cada job pide solo lo que necesita.
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+  IMAGE_NAME: storego
+
+jobs:
+  # ---------------------------------------------------------------------------------------
+  # IE2 - Pruebas unitarias + cobertura (Vitest, provider v8). Umbrales en vitest.config.js.
+  # ---------------------------------------------------------------------------------------
+  test:
+    name: Pruebas y cobertura
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Pruebas unitarias con cobertura (falla si baja de los umbrales)
+        run: npm run test:ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------------------
+  # IE3 - Análisis estático y de calidad: SonarCloud (usa coverage/lcov.info, rol de JaCoCo en JS).
+  # Bloquea el pipeline si el Quality Gate falla (sonar.qualitygate.wait=true).
+  # ---------------------------------------------------------------------------------------
+  sonarcloud:
+    name: SonarCloud (Quality Gate)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verificar secreto SONAR_TOKEN
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "::error::Falta el secreto SONAR_TOKEN (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SonarCloud necesita el historial completo para atribuir líneas nuevas
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage
+      - name: Análisis SonarCloud
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+
+  # ---------------------------------------------------------------------------------------
+  # IE3 - Dependencias: npm audit + Snyk Open Source. Bloquea con hallazgos HIGH o CRITICAL.
+  # ---------------------------------------------------------------------------------------
+  dependencies:
+    name: Dependencias (npm audit + Snyk)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verificar secreto SNYK_TOKEN
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::error::Falta el secreto SNYK_TOKEN (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: npm audit (solo dependencias de producción)
+        run: npm audit --omit=dev --audit-level=high
+      - uses: snyk/actions/setup@master
+      - name: Snyk Open Source
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk test --severity-threshold=high
+
+  # ---------------------------------------------------------------------------------------
+  # IE1 - Construcción de la imagen Docker + escaneo Snyk Container. Solo avanzan si pasan
+  # pruebas, SonarCloud y dependencias.
+  # ---------------------------------------------------------------------------------------
+  build:
+    name: Imagen Docker
+    needs: [test, sonarcloud, dependencies]
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.vars.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: vars
+        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Construir imagen (multi-stage, usuario no root)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.short_sha }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.vars.outputs.short_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verificar que la imagen no corre como root
+        run: |
+          USER_ID=$(docker run --rm --entrypoint id "$IMAGE_NAME:${{ steps.vars.outputs.short_sha }}" -u)
+          echo "UID del proceso: $USER_ID"
+          test "$USER_ID" != "0"
+      - uses: snyk/actions/setup@master
+      - name: Snyk Container (bloquea con HIGH/CRITICAL de la aplicación)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then echo "::error::Falta SNYK_TOKEN"; exit 1; fi
+          snyk container test "$IMAGE_NAME:${{ steps.vars.outputs.short_sha }}" \
+            --file=Dockerfile --severity-threshold=high --exclude-base-image-vulns
+      - name: Exportar imagen para los jobs siguientes (sin reconstruir)
+        run: docker save "$IMAGE_NAME:${{ steps.vars.outputs.short_sha }}" -o image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar
+          retention-days: 3
+
+  # ---------------------------------------------------------------------------------------
+  # IE5 - Valida la orquestación completa con Docker Compose (db + init + 2 réplicas + balanceador)
+  # ---------------------------------------------------------------------------------------
+  compose-validate:
+    name: Orquestación (Docker Compose)
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      STOREGO_IMAGE: storego:${{ needs.build.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - run: docker load -i image.tar
+      - name: Generar secretos efímeros para esta ejecución
+        run: |
+          {
+            echo "STOREGO_DB_PASSWORD=$(openssl rand -hex 16)"
+            echo "STOREGO_JWT_SECRET=$(openssl rand -hex 32)"
+            echo "STOREGO_REPLICAS=2"
+            echo "STOREGO_IMAGE=$STOREGO_IMAGE"
+          } > .env.docker
+      - name: Validar sintaxis del compose
+        run: docker compose --env-file .env.docker config -q
+      - name: Levantar la pila y esperar los healthchecks
+        run: docker compose --env-file .env.docker up -d --wait --no-build
+      - name: Pruebas de humo
+        run: |
+          set -euo pipefail
+          BASE=http://localhost:8080
+          echo "Réplicas de la API: $(docker compose --env-file .env.docker ps -q api | wc -l)"
+          test "$(docker compose --env-file .env.docker ps -q api | wc -l)" -eq 2
+
+          curl -fsS "$BASE/api/health" | tee /dev/stderr | grep -q '"ok":true'
+          curl -fsS "$BASE/api/productos" | grep -q '"PlayStation 5"'
+          curl -fsS "$BASE/" | grep -qi '<div id="root">'
+
+          echo "Cabeceras de seguridad del balanceador:"
+          HEADERS=$(curl -fsSI "$BASE/")
+          echo "$HEADERS" | grep -qi 'x-content-type-options: nosniff'
+          echo "$HEADERS" | grep -qi 'x-frame-options: DENY'
+          echo "$HEADERS" | grep -qi 'content-security-policy'
+
+          echo "Login con la cuenta semilla:"
+          curl -fsS -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
+            -d '{"email":"admin@duoc.cl","password":"admin123"}' | grep -q '"token"'
+      - name: Escalar a 3 réplicas
+        run: |
+          docker compose --env-file .env.docker up -d --scale api=3 --no-recreate --no-build --wait
+          test "$(docker compose --env-file .env.docker ps -q api | wc -l)" -eq 3
+      - name: Resiliencia - el servicio sigue respondiendo si cae una réplica
+        run: |
+          VICTIM=$(docker compose --env-file .env.docker ps -q api | head -n1)
+          docker kill "$VICTIM"
+          for i in $(seq 1 20); do curl -fsS http://localhost:8080/api/health > /dev/null; done
+          echo "20/20 peticiones atendidas por las réplicas restantes"
+      - name: Logs si algo falló
+        if: failure()
+        run: docker compose --env-file .env.docker logs --no-color --tail=100
+      - name: Limpiar
+        if: always()
+        run: docker compose --env-file .env.docker down -v
+
+  # ---------------------------------------------------------------------------------------
+  # IE4 - Publica la imagen en GHCR con el SHA del commit (solo en main).
+  # ---------------------------------------------------------------------------------------
+  publish:
+    name: Publicar en GHCR
+    needs: [build, compose-validate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - run: docker load -i image.tar
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Etiquetar y subir (:sha corto y :latest)
+        env:
+          SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+        run: |
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag "$IMAGE_NAME:$SHORT_SHA" "$REPO:$SHORT_SHA"
+          docker tag "$IMAGE_NAME:$SHORT_SHA" "$REPO:latest"
+          docker push "$REPO:$SHORT_SHA"
+          docker push "$REPO:latest"
+
+  # ---------------------------------------------------------------------------------------
+  # IE4 - Despliegue automático al entorno simulado "staging" (Docker Compose en el runner)
+  # con verificación de trazabilidad commit -> imagen -> contenedor en ejecución.
+  # ---------------------------------------------------------------------------------------
+  deploy:
+    name: Despliegue a staging
+    needs: [build, publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: http://localhost:8080
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Preparar configuración del entorno
+        env:
+          SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+        run: |
+          {
+            echo "STOREGO_DB_PASSWORD=$(openssl rand -hex 16)"
+            echo "STOREGO_JWT_SECRET=$(openssl rand -hex 32)"
+            echo "STOREGO_REPLICAS=2"
+            echo "STOREGO_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:$SHORT_SHA"
+          } > .env.docker
+      - name: Descargar la imagen publicada y desplegar
+        run: |
+          docker compose --env-file .env.docker pull api
+          docker compose --env-file .env.docker up -d --wait --no-build
+      - name: Verificar trazabilidad (commit -> imagen -> contenedor)
+        run: |
+          set -euo pipefail
+          LABEL=$(docker inspect "$(docker compose --env-file .env.docker ps -q api | head -n1)" \
+                  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          API_COMMIT=$(curl -fsS http://localhost:8080/api/health | sed -E 's/.*"commit":"([^"]+)".*/\1/')
+          echo "Commit del pipeline : $GITHUB_SHA"
+          echo "Etiqueta de la imagen: $LABEL"
+          echo "Commit que informa la API: $API_COMMIT"
+          test "$LABEL" = "$GITHUB_SHA"
+          test "$API_COMMIT" = "$GITHUB_SHA"
+      - name: Registro de despliegue
+        if: always()
+        run: |
+          {
+            echo "### Despliegue staging"
+            echo "- Imagen: \`ghcr.io/${GITHUB_REPOSITORY,,}:${{ needs.build.outputs.short_sha }}\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Rama: \`$GITHUB_REF_NAME\`"
+            echo "- Ejecutado por: @$GITHUB_ACTOR (run #$GITHUB_RUN_NUMBER)"
+            echo "- Estado: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Logs si algo falló
+        if: failure()
+        run: docker compose --env-file .env.docker logs --no-color --tail=100
+      - name: Apagar el entorno simulado
+        if: always()
+        run: docker compose --env-file .env.docker down -v
