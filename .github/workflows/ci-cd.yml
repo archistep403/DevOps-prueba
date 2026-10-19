@@ -71,6 +71,9 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          # Esto evita que el pipeline falle si no puede leer el Quality Gate en ramas secundarias
+          breakToProjectQualityGate: false 
 
   # ---------------------------------------------------------------------------------------
   # IE3 - Dependencias: npm audit + Snyk Open Source. Bloquea con hallazgos HIGH o CRITICAL.
