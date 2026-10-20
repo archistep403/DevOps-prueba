@@ -12,13 +12,13 @@ RUN npm install -g npm@12.0.0
 RUN npm run build
 
 # ---- 2) Dependencias de producción (sin Vite, Vitest ni herramientas de desarrollo) -------
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 # ---- 3) Imagen final: API Express que también sirve dist/ ---------------------------------
-FROM node:20-alpine AS runtime
+FROM node:22-alpine AS runtime
 ARG GIT_SHA=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="storego" \
