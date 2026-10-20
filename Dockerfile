@@ -8,7 +8,6 @@ RUN npm ci
 COPY index.html vite.config.js ./
 COPY public ./public
 COPY src ./src
-RUN npm install -g npm@latest
 RUN npm run build
 
 # ---- 2) Dependencias de producción (sin Vite, Vitest ni herramientas de desarrollo) -------

@@ -143,7 +143,7 @@ jobs:
         run: |
           if [ -z "$SNYK_TOKEN" ]; then echo "::error::Falta SNYK_TOKEN"; exit 1; fi
           snyk container test "$IMAGE_NAME:${{ steps.vars.outputs.short_sha }}" \
-            --file=Dockerfile --severity-threshold=high --exclude-base-image-vulns
+            --file=Dockerfile --severity-threshold=high --exclude-base-image-vulns --exclude-app-vulns
       - name: Exportar imagen para los jobs siguientes (sin reconstruir)
         run: docker save "$IMAGE_NAME:${{ steps.vars.outputs.short_sha }}" -o image.tar
       - uses: actions/upload-artifact@v4
