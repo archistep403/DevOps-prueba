@@ -8,17 +8,21 @@ RUN npm ci
 COPY index.html vite.config.js ./
 COPY public ./public
 COPY src ./src
-RUN npm install -g npm@12.0.0
 RUN npm run build
 
 # ---- 2) Dependencias de producción (sin Vite, Vitest ni herramientas de desarrollo) -------
 FROM node:22-alpine AS deps
 WORKDIR /app
+# Actualizamos npm aquí para asegurar que el comando 'npm ci' no use la versión vulnerable
+RUN npm install -g npm@12.0.0
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 # ---- 3) Imagen final: API Express que también sirve dist/ ---------------------------------
 FROM node:22-alpine AS runtime
+# Actualizamos npm en la imagen final para limpiar las vulnerabilidades globales que detecta Snyk
+RUN npm install -g npm@12.0.0
+
 ARG GIT_SHA=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="storego" \
@@ -32,6 +36,7 @@ COPY --from=deps  --chown=node:node /app/node_modules ./node_modules
 COPY --chown=node:node package.json ./
 COPY --chown=node:node server ./server
 COPY --from=build --chown=node:node /app/dist ./dist
+
 # El proceso nunca corre como root (usuario "node", UID 1000).
 USER node
 EXPOSE 3001
